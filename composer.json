@@ -1,0 +1,33 @@
+{
+  "name": "axisvela/praxo-core",
+  "description": "Embeddable MIT-licensed agent framework for PHP: tools, policy, events, memory, middleware, and an agent loop",
+  "type": "library",
+  "license": "MIT",
+  "homepage": "https://github.com/axisvela/praxo-core-php",
+  "support": {
+    "issues": "https://github.com/axisvela/praxo-core-php/issues",
+    "source": "https://github.com/axisvela/praxo-core-php"
+  },
+  "keywords": [
+    "agents",
+    "llm",
+    "agent-framework",
+    "tool-calling"
+  ],
+  "authors": [
+    {
+      "name": "AxisVela"
+    }
+  ],
+  "require": {
+    "php": ">=8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "Praxo\\Core\\": "src/"
+    }
+  },
+  "config": {
+    "sort-packages": true
+  }
+}
