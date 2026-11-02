@@ -7,7 +7,7 @@ Schema validation, and plugin manifest parsing. It runs in-process and does not
 require a hosted service.
 
 - `SPEC_VERSION`: `0.2.0`
-- Core version: `0.1.0`
+- Core version: `0.3.0`
 - License: MIT
 - Dependencies: none beyond the PHP standard library
 
@@ -26,7 +26,9 @@ composer require axisvela/praxo-core
 The Core implements all eleven vector groups: toolcall, jsonschema, plugin,
 checkpoint, event, memory, policy, stream, context, middleware, and agent loop.
 It includes a public API snapshot and dependency-free tests. Provider adapters
-are not included in `0.1.0`.
+are not included in `0.3.0`. Caller-provided `batchToolInvoker` and
+`maxParallelTools` enable cooperative parallel tool dispatch without
+Core-created threads.
 
 ## Validation
 
@@ -76,8 +78,8 @@ $agent = new Agent($options);
 ## Layout
 
 - `src/` library (PSR-4 `Praxo\Core\`).
-- `api/0.1.0.txt` checked-in public API snapshot.
+- `api/0.3.0.txt` checked-in public API snapshot.
 
 ## Release
 
-Tag shape: `v0.1.0`. The tag targets `SPEC_VERSION` `0.2.0`.
+Tag shape: `v0.3.0`. The tag targets `SPEC_VERSION` `0.2.0`.

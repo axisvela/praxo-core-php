@@ -129,6 +129,9 @@ final class AgentOptions
     public ?array $responseFormat = null;
     public int $maxSteps = 8;
     public int $maxTokens = 0;
+    public mixed $cancellation = null;
+    public int $maxParallelTools = 1;
+    public mixed $batchToolInvoker = null;
 
     public function __construct(public Model $model)
     {
@@ -171,6 +174,21 @@ final class Agent
 
     public function run(Session $session, string $prompt): RunResult
     {
+        return $this->runInternal($session, $prompt, null);
+    }
+
+    public function runStream(Session $session, string $prompt, callable $onDelta): RunResult
+    {
+        return $this->runInternal($session, $prompt, $onDelta);
+    }
+
+    private function runInternal(
+        Session $session,
+        string $prompt,
+        mixed $onDelta,
+    ): RunResult
+    {
+        $this->throwIfCancelled();
         $maxSteps = $this->options->maxSteps > 0 ? $this->options->maxSteps : 8;
         $runId = 'run-' . (int) floor(microtime(true) * 1000);
         $messages = array_map(self::cloneMessage(...), $session->messages);
@@ -180,11 +198,18 @@ final class Agent
         $messages[] = Message::text(Roles::USER, $prompt);
         $usage = new Usage();
 
-        $this->beforeRun($runId, $prompt);
+        $entered = [];
+        try {
+            $this->beforeRun($runId, $prompt, $entered);
+        } catch (\Throwable $startupError) {
+            $this->afterRun($entered, null, self::asPraxoException($startupError));
+            throw $startupError;
+        }
         $this->emit('run.started', $session->id, $runId);
         $afterRunInvoked = false;
         try {
             for ($step = 1; $step <= $maxSteps; $step++) {
+                $this->throwIfCancelled();
                 $this->authorize(new Action('model.generate', $session->id));
                 $messages = $this->compact($messages);
                 $request = new Request(
@@ -198,9 +223,15 @@ final class Agent
                 if ($call->skip) {
                     $response = $call->response
                         ?? throw new PraxoException('AGENT_MIDDLEWARE', 'agent: model middleware skipped without a response');
+                } elseif ($onDelta !== null) {
+                    if (!$this->options->model instanceof StreamingModel) {
+                        throw new PraxoException('AGENT_STREAM', 'agent: model does not support streaming');
+                    }
+                    $response = $this->options->model->generateStream($call->request, $onDelta);
                 } else {
                     $response = $this->generate($call->request);
                 }
+                $this->throwIfCancelled();
                 $this->afterModel($call, $response);
                 $usage = $usage->plus($response->usage);
                 if ($this->options->maxTokens > 0
@@ -216,18 +247,61 @@ final class Agent
                         usage: $usage,
                     );
                     $afterRunInvoked = true;
-                    $this->afterRun($result, null);
+                    $cleanupError = $this->afterRun($entered, $result, null);
+                    if ($cleanupError !== null) {
+                        throw $cleanupError;
+                    }
                     $this->emit('run.completed', $session->id, $runId);
                     return $result;
                 }
-                foreach ($response->message->toolCalls as $toolCall) {
-                    $messages[] = $this->invokeTool($toolCall, $runId, $session->id);
+                $toolCalls = $response->message->toolCalls;
+                if ($this->options->batchToolInvoker !== null) {
+                    $prepared = [];
+                    foreach ($toolCalls as $toolCall) {
+                        $this->throwIfCancelled();
+                        $prepared[] = $this->prepareTool($toolCall, $runId, $session->id);
+                    }
+                    $invocable = [];
+                    $invocableIndexes = [];
+                    foreach ($prepared as $index => $entry) {
+                        if (!$entry['skip']) {
+                            $invocable[] = $entry;
+                            $invocableIndexes[] = $index;
+                        }
+                    }
+                    $values = ($this->options->batchToolInvoker)(
+                        $invocable,
+                        $this->options->maxParallelTools,
+                    );
+                    $byIndex = [];
+                    foreach ($invocable as $position => $entry) {
+                        $byIndex[$invocableIndexes[$position]] = $values[$position] ?? null;
+                    }
+                    foreach ($prepared as $index => $entry) {
+                        if ($entry['skip']) {
+                            $messages[] = $this->completePreparedTool(
+                                $entry,
+                                $entry['value'],
+                                $entry['error'],
+                            );
+                        } else {
+                            $messages[] = $this->completePreparedTool(
+                                $entry,
+                                $byIndex[$index],
+                            );
+                        }
+                    }
+                } else {
+                    foreach ($toolCalls as $toolCall) {
+                        $this->throwIfCancelled();
+                        $messages[] = $this->invokeTool($toolCall, $runId, $session->id);
+                    }
                 }
             }
             throw PraxoException::maxSteps();
-        } catch (PraxoException $error) {
+        } catch (\Throwable $error) {
             if (!$afterRunInvoked) {
-                $this->afterRun(null, $error);
+                $this->afterRun($entered, null, self::asPraxoException($error));
             }
             $this->emit('run.failed', $session->id, $runId, ['error' => $error->getMessage()]);
             throw $error;
@@ -280,37 +354,102 @@ final class Agent
 
     private function invokeTool(ToolCall $call, string $runId, string $sessionId): Message
     {
+        return $this->executePreparedTool($this->prepareTool($call, $runId, $sessionId));
+    }
+
+    /** @return array<string, mixed> */
+    private function prepareTool(ToolCall $call, string $runId, string $sessionId): array
+    {
+        $this->throwIfCancelled();
         if (!$this->toolAllowed($call->name)) {
             throw new PraxoException('AGENT_TOOL_NOT_ALLOWED', "agent: tool {$call->name} is not allowed");
         }
-        $this->authorize(new Action('tool.invoke', $sessionId, $call->name, $call->arguments));
-        $tools = $this->options->tools
-            ?? throw PraxoException::toolNotFound("tool {$call->name} is not registered");
-        $tool = $tools->get($call->name);
+        $originalName = $call->name;
+        $originalArguments = $call->arguments;
+        $this->authorize(new Action('tool.invoke', $sessionId, $originalName, $originalArguments));
         $middlewareCall = new MiddlewareToolCall($runId, $sessionId, $call);
         $this->beforeTool($middlewareCall);
-        if ($middlewareCall->skip) {
-            $value = $middlewareCall->result;
-            $error = $middlewareCall->error;
-        } else {
-            $this->emit('tool.call', $sessionId, $runId, [
-                'name' => $call->name,
-                'arguments' => $call->arguments,
-            ]);
-            try {
-                $value = $tool->invoke($call->arguments);
-                $error = null;
-            } catch (PraxoException $exception) {
-                $value = null;
-                $error = $exception;
-            }
+        $finalCall = $middlewareCall->call;
+        if (!$this->toolAllowed($finalCall->name)) {
+            throw new PraxoException(
+                'AGENT_TOOL_NOT_ALLOWED',
+                "agent: tool {$finalCall->name} is not allowed",
+            );
         }
+        $changed = $finalCall->name !== $originalName
+            || Json::encode($finalCall->arguments) !== Json::encode($originalArguments);
+        if ($changed) {
+            $this->authorize(new Action(
+                'tool.invoke',
+                $sessionId,
+                $finalCall->name,
+                $finalCall->arguments,
+            ));
+        }
+        if ($middlewareCall->skip) {
+            return [
+                'middleware' => $middlewareCall,
+                'call' => $finalCall,
+                'skip' => true,
+                'value' => $middlewareCall->result,
+                'error' => $middlewareCall->error,
+            ];
+        }
+        $this->throwIfCancelled();
+        $tools = $this->options->tools
+            ?? throw PraxoException::toolNotFound("tool {$finalCall->name} is not registered");
+        $tool = $tools->get($finalCall->name);
+        $this->emit('tool.call', $sessionId, $runId, [
+            'name' => $finalCall->name,
+            'arguments' => $finalCall->arguments,
+        ]);
+        return [
+            'middleware' => $middlewareCall,
+            'call' => $finalCall,
+            'skip' => false,
+            'tool' => $tool,
+        ];
+    }
+
+    /** @param array<string, mixed> $prepared */
+    private function executePreparedTool(array $prepared): Message
+    {
+        if ($prepared['skip']) {
+            return $this->completePreparedTool(
+                $prepared,
+                $prepared['value'],
+                $prepared['error'],
+            );
+        }
+        try {
+            $value = $prepared['tool']->invoke($prepared['call']->arguments);
+            $error = null;
+        } catch (PraxoException $exception) {
+            $value = null;
+            $error = $exception;
+        }
+        return $this->completePreparedTool($prepared, $value, $error);
+    }
+
+    /** @param array<string, mixed> $prepared */
+    private function completePreparedTool(
+        array $prepared,
+        mixed $value,
+        ?PraxoException $error = null,
+    ): Message {
         $result = new ToolResult($value, $error);
-        $this->afterTool($middlewareCall, $result);
+        $this->afterTool($prepared['middleware'], $result);
         if ($result->error !== null) {
             throw $result->error;
         }
-        return Message::tool(Json::encode($result->value), $call->id);
+        return Message::tool(Json::encode($result->value), $prepared['call']->id);
+    }
+
+    private function throwIfCancelled(): void
+    {
+        if ($this->options->cancellation !== null && ($this->options->cancellation)()) {
+            throw new PraxoException('AGENT_CANCELLED', 'agent: cancelled');
+        }
     }
 
     private function authorize(Action $action): void
@@ -327,12 +466,21 @@ final class Agent
         }
     }
 
-    private function beforeRun(string $runId, string $prompt): void
+    /** @param list<BaseMiddleware> $entered */
+    private function beforeRun(string $runId, string $prompt, array &$entered): void
     {
         $state = new RunState($runId, $prompt);
         foreach ($this->middleware as $middleware) {
+            $entered[] = $middleware;
             $middleware->beforeRun($state);
         }
+    }
+
+    private static function asPraxoException(\Throwable $error): PraxoException
+    {
+        return $error instanceof PraxoException
+            ? $error
+            : new PraxoException('AGENT_MIDDLEWARE', $error->getMessage());
     }
 
     private function beforeModel(ModelCall $call): void
@@ -369,11 +517,26 @@ final class Agent
         }
     }
 
-    private function afterRun(?RunResult $result, ?PraxoException $error): void
-    {
-        foreach ($this->middleware as $middleware) {
-            $middleware->afterRun($result, $error);
+    /**
+     * @param list<BaseMiddleware> $entered
+     */
+    private function afterRun(
+        array $entered,
+        ?RunResult $result,
+        ?PraxoException $error,
+    ): ?\Throwable {
+        $firstError = null;
+        foreach ($entered as $middleware) {
+            try {
+                $middleware->afterRun($result, $error);
+            } catch (\Throwable $caught) {
+                $firstError ??= $caught;
+                if ($error === null) {
+                    $error = self::asPraxoException($caught);
+                }
+            }
         }
+        return $firstError;
     }
 
     private function emit(string $type, string $sessionId, string $runId, ?array $data = null): void
