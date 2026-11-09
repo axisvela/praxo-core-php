@@ -25,7 +25,10 @@
   "autoload": {
     "psr-4": {
       "Praxo\\Core\\": "src/"
-    }
+    },
+    "files": [
+      "src/autoload.php"
+    ]
   },
   "config": {
     "sort-packages": true
