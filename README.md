@@ -1,4 +1,4 @@
-# PRAXO-CORE PHP Core
+﻿# PRAXO-CORE PHP Core
 
 PRAXO-CORE is an embeddable, MIT-licensed agent framework. This package is its
 native PHP Core: an agent loop with tool registration and dispatch, policy
@@ -6,8 +6,8 @@ hooks, typed events, memory, checkpoints, context budgets, middleware, JSON
 Schema validation, and plugin manifest parsing.
 
 - `SPEC_VERSION`: `0.2.0`
-- Core version: `0.4.1`
-- The latest Packagist package is `axisvela/praxo-core@0.4.1`
+- Core version: `0.5.0`
+- The latest Packagist package is `axisvela/praxo-core@0.5.0`
 - License: MIT
 - Dependencies: none beyond the PHP standard library
 - Runtime: use a patched PHP release. On Windows use `8.2.35-1`, `8.3.36-1`,
@@ -111,3 +111,4 @@ exactly-once delivery. Use HTTPS and filter sensitive event data first.
 
 Tag shape: `php/v0.4.1`. The tag targets `SPEC_VERSION` `0.2.0`. See
 [CHANGELOG.md](CHANGELOG.md) for per-release changes and compatibility notes.
+
