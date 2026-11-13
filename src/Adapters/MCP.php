@@ -26,8 +26,9 @@ final class MCPClient
 
     public function __construct(
         private readonly MCPTransport $transport,
-        private readonly string $clientVersion = '0.5.0',
+        private readonly string $clientVersion = '0.6.0',
         private readonly float $timeout = 5.0,
+        private readonly string $requestedProtocolVersion = '2024-11-05',
     ) {
     }
 
@@ -47,7 +48,7 @@ final class MCPClient
             return $this;
         }
         $result = $this->transport->request('initialize', [
-            'protocolVersion' => '2024-11-05',
+            'protocolVersion' => $this->requestedProtocolVersion,
             'capabilities' => [],
             'clientInfo' => ['name' => 'praxo-core', 'version' => $this->clientVersion],
         ], $this->timeout);

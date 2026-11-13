@@ -1,0 +1,1169 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Praxo\Tests;
+
+require __DIR__ . '/../src/autoload.php';
+
+use Praxo\Core\Action;
+use Praxo\Core\Agent;
+use Praxo\Core\AgentOptions;
+use Praxo\Core\BaseMiddleware;
+use Praxo\Core\CallLimitMiddleware;
+use Praxo\Core\Decision;
+use Praxo\Core\Event;
+use Praxo\Core\EventSink;
+use Praxo\Core\PolicyHook;
+use Praxo\Core\CheckpointAllowlist;
+use Praxo\Core\ContextBudget;
+use Praxo\Core\ContextEstimator;
+use Praxo\Core\FuncTool;
+use Praxo\Core\InMemoryMemoryStore;
+use Praxo\Core\Interrupt;
+use Praxo\Core\InterruptAction;
+use Praxo\Core\InterruptDecision;
+use Praxo\Core\Json;
+use Praxo\Core\JsonSchema;
+use Praxo\Core\MemoryRecord;
+use Praxo\Core\Message;
+use Praxo\Core\MiddlewareToolCall;
+use Praxo\Core\Model;
+use Praxo\Core\ModelCall;
+use Praxo\Core\PathChecker;
+use Praxo\Core\PathGrant;
+use Praxo\Core\PiiRedactor;
+use Praxo\Core\Plugin;
+use Praxo\Core\PraxoException;
+use Praxo\Core\Request;
+use Praxo\Core\Response;
+use Praxo\Core\Roles;
+use Praxo\Core\RunResult;
+use Praxo\Core\RunState;
+use Praxo\Core\Session;
+use Praxo\Core\StaticModel;
+use Praxo\Core\StreamingModel;
+use Praxo\Core\ToolCall;
+use Praxo\Core\ToolCallParser;
+use Praxo\Core\ToolRegistry;
+
+final class ToolModel implements Model
+{
+    private int $step = 0;
+
+    public function generate(Request $request): Response
+    {
+        if ($this->step++ === 0) {
+            return new Response(Message::assistant('', [
+                new ToolCall('c1', 'echo', ['text' => 'hi']),
+            ]));
+        }
+        return new Response(Message::assistant('done'));
+    }
+}
+
+final class ParallelModel implements Model
+{
+    private int $step = 0;
+    /** @var list<string> */
+    public array $order = [];
+
+    public function generate(Request $request): Response
+    {
+        if ($this->step++ === 0) {
+            return new Response(Message::assistant('', [
+                new ToolCall('c1', 'a', []),
+                new ToolCall('c2', 'b', []),
+            ]));
+        }
+        foreach ($request->messages as $message) {
+            if ($message->role === Roles::TOOL && $message->toolId !== null) {
+                $this->order[] = $message->toolId;
+            }
+        }
+        return new Response(Message::assistant('done'));
+    }
+}
+
+final class RecordingPolicy implements PolicyHook
+{
+    /** @var list<Action> */
+    public array $actions = [];
+    public mixed $handler = null;
+
+    public function authorize(Action $action): Decision
+    {
+        $this->actions[] = $action;
+        return $this->handler === null
+            ? Decision::allow('ok')
+            : ($this->handler)($action);
+    }
+}
+
+final class MutatingMiddleware extends BaseMiddleware
+{
+    public mixed $mutate = null;
+    public int $beforeToolCalls = 0;
+
+    public function beforeTool(MiddlewareToolCall $call): void
+    {
+        $this->beforeToolCalls++;
+        if ($this->mutate !== null) {
+            ($this->mutate)($call);
+        }
+    }
+}
+
+final class LifecycleMiddleware extends BaseMiddleware
+{
+    public mixed $before = null;
+    public mixed $after = null;
+
+    public function beforeRun(RunState $state): void
+    {
+        if ($this->before !== null) {
+            ($this->before)($state);
+        }
+    }
+
+    public function afterRun(?RunResult $result, ?PraxoException $error): void
+    {
+        if ($this->after !== null) {
+            ($this->after)($result, $error);
+        }
+    }
+}
+
+final class RecordingSink implements EventSink
+{
+    /** @var list<Event> */
+    public array $events = [];
+
+    public function emit(Event $event): void
+    {
+        $this->events[] = $event;
+    }
+}
+
+final class FailingModel implements Model
+{
+    public function generate(Request $request): Response
+    {
+        throw new PraxoException('RUN_FAILED', 'run failed');
+    }
+}
+
+final class CancellingModel implements Model
+{
+    public function __construct(private mixed $cancel)
+    {
+    }
+
+    public function generate(Request $request): Response
+    {
+        ($this->cancel)();
+        return new Response(Message::assistant('done'));
+    }
+}
+
+final class CancellationToolModel implements Model
+{
+    private int $step = 0;
+
+    public function generate(Request $request): Response
+    {
+        if ($this->step++ === 0) {
+            return new Response(Message::assistant('', [
+                new ToolCall('c1', 'cancel', []),
+                new ToolCall('c2', 'effect', []),
+            ]));
+        }
+        return new Response(Message::assistant('done'));
+    }
+}
+
+final class StreamFailureModel implements Model, StreamingModel
+{
+    public function generate(Request $request): Response
+    {
+        return new Response(Message::assistant('done'));
+    }
+
+    public function generateStream(Request $request, callable $onDelta): Response
+    {
+        $onDelta('x');
+        return new Response(Message::assistant('done'));
+    }
+}
+$passed = 0;
+
+function check(bool $condition, string $message): void
+{
+    global $passed;
+    if (!$condition) {
+        throw new \RuntimeException($message);
+    }
+    $passed++;
+}
+
+$call = ToolCallParser::parse('{"name":"echo","input":{"text":"hi"}}');
+check($call !== null && $call->name === 'echo' && $call->input['text'] === 'hi', 'toolcall json');
+check(
+    ToolCallParser::stripMarkup('hello<tool_call name="echo">{"text":"hi"}</tool_call>world') === 'helloworld',
+    'toolcall strip',
+);
+
+$schema = Json::decode('{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}');
+$errors = JsonSchema::validate($schema, []);
+check(count($errors) === 1 && $errors[0]->path === '$.name', 'schema required');
+check(JsonSchema::validate($schema, ['name' => 'ok']) === [], 'schema valid');
+$unicodeSchema = Json::decode('{"type":"string","minLength":2,"maxLength":2}');
+check(JsonSchema::validate($unicodeSchema, '你好') === [], 'schema unicode two');
+check(count(JsonSchema::validate($unicodeSchema, '你')) === 1, 'schema unicode one');
+$integerSchema = Json::decode('{"type":"integer"}');
+check(JsonSchema::validate($integerSchema, 2) === [], 'schema integer');
+check(count(JsonSchema::validate($integerSchema, 2.5)) === 1, 'schema integer fraction');
+
+$messages = [
+    Message::text(Roles::SYSTEM, 'sys'),
+    Message::text(Roles::USER, 'message 0'),
+    Message::text(Roles::USER, 'message 1'),
+];
+check(ContextEstimator::estimateTokens($messages) === 16, 'context estimate');
+
+$store = new InMemoryMemoryStore();
+$store->put('s1', new MemoryRecord('m1', 'event', 'Alpha', null, '2026-01-01T00:00:00Z'));
+$store->put('s1', new MemoryRecord('m2', 'event', 'beta', null, '2026-01-02T00:00:00Z'));
+$found = $store->search('s1', 'alpha', 10);
+check(count($found) === 1 && $found[0]->id === 'm1', 'memory search');
+
+$allow = new CheckpointAllowlist();
+$allow->register('spec.payload');
+$encoded = $allow->marshal('spec.payload', ['value' => 'x']);
+check($allow->unmarshal($encoded)['value'] === 'x', 'checkpoint roundtrip');
+try {
+    $allow->marshal('spec.missing', []);
+    check(false, 'checkpoint unregistered');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'CHECKPOINT_TYPE_NOT_ALLOWED', 'checkpoint code');
+}
+
+check(PiiRedactor::defaults()->redact('email a@b.com') === 'email [REDACTED:email]', 'pii redaction');
+$piiHistory = [
+    'messages' => [[
+        'content' => 'email a@b.com',
+        'toolCalls' => [[
+            'arguments' => ['email' => 'a@b.com', 'nested' => ['ssn' => '123-45-6789']],
+        ]],
+    ]],
+];
+$redactedHistory = PiiRedactor::defaults()->redactValue($piiHistory);
+check(
+    $redactedHistory['messages'][0]['toolCalls'][0]['arguments']['email'] === '[REDACTED:email]',
+    'pii tool-call email',
+);
+check(
+    $redactedHistory['messages'][0]['toolCalls'][0]['arguments']['nested']['ssn'] === '[REDACTED:ssn]',
+    'pii nested tool-call ssn',
+);
+check($piiHistory['messages'][0]['toolCalls'][0]['arguments']['email'] === 'a@b.com', 'pii caller arguments unchanged');
+$manifest = Plugin::parseManifest('{"schemaVersion":1,"id":"com.example.echo","version":"1.0.0","kind":"tool.provider.v1","entrypoint":{"type":"process","command":"echo"},"protocol":"jsonrpc-2","capabilities":[],"permissions":{},"limits":{},"health":{},"isolation":"process"}');
+check($manifest->id === 'com.example.echo', 'plugin manifest');
+
+$root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'praxo-test-' . bin2hex(random_bytes(6));
+mkdir($root . DIRECTORY_SEPARATOR . 'root', 0777, true);
+mkdir($root . DIRECTORY_SEPARATOR . 'outside', 0777, true);
+try {
+    $checker = new PathChecker([new PathGrant($root . DIRECTORY_SEPARATOR . 'root', 'readwrite')]);
+    check($checker->check($root . DIRECTORY_SEPARATOR . 'root' . DIRECTORY_SEPARATOR . 'a.txt', 'read')->allowed, 'policy inside');
+    check(!$checker->check($root . DIRECTORY_SEPARATOR . 'outside' . DIRECTORY_SEPARATOR . 'x.txt', 'read')->allowed, 'policy outside');
+} finally {
+    @rmdir($root . DIRECTORY_SEPARATOR . 'root');
+    @rmdir($root . DIRECTORY_SEPARATOR . 'outside');
+    @rmdir($root);
+}
+
+$modelLimit = new CallLimitMiddleware(1, 0);
+$modelCall = new ModelCall('r1');
+$modelLimit->beforeModel($modelCall);
+try {
+    $modelLimit->beforeModel($modelCall);
+    check(false, 'model call limit');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_MODEL_CALL_LIMIT', 'model call limit code');
+}
+$toolLimit = new CallLimitMiddleware(0, 1);
+$toolCall = new MiddlewareToolCall('r2');
+$toolLimit->beforeTool($toolCall);
+try {
+    $toolLimit->beforeTool($toolCall);
+    check(false, 'tool call limit');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_TOOL_CALL_LIMIT', 'tool call limit code');
+}
+
+$isolatedLimit = new CallLimitMiddleware(1, 0);
+$firstCall = new ModelCall('r1');
+$secondCall = new ModelCall('r2');
+$isolatedLimit->beforeModel($firstCall);
+$isolatedLimit->beforeModel($secondCall);
+try {
+    $isolatedLimit->beforeModel($firstCall);
+    check(false, 'call limit run isolation');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_MODEL_CALL_LIMIT', 'call limit run isolation code');
+}
+
+$capacityOptions = new AgentOptions(new StaticModel('done'));
+$capacityOptions->systemPrompt = str_repeat('x', 1000);
+$capacityOptions->context = new ContextBudget(10, 0);
+try {
+    (new Agent($capacityOptions))->run(new Session('s1'), 'go');
+    check(false, 'capacity fail closed');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_CONTEXT_BUDGET', 'capacity fail closed code');
+}
+
+$agent = new Agent(new AgentOptions(new StaticModel('hello')));
+$result = $agent->run(new Session('s1'), 'hello');
+check($result->output === 'hello' && $result->steps === 1, 'agent direct');
+
+$calls = 0;
+$registry = new ToolRegistry();
+$registry->register(new FuncTool('echo', 'Echo', static function (array $arguments) use (&$calls): array {
+    $calls++;
+    return $arguments;
+}));
+$agentOptions = new AgentOptions(new ToolModel());
+$agentOptions->tools = $registry;
+$agentOptions->maxSteps = 8;
+$agent = new Agent($agentOptions);
+$result = $agent->run(new Session('s1'), 'use the tool');
+check($result->output === 'done' && $result->steps === 2 && $calls === 1, 'agent tool loop');
+
+$invoked = [];
+$registry = new ToolRegistry();
+$registry->register(new FuncTool('echo', 'Echo', static function (array $arguments) use (&$invoked): array {
+    $invoked[] = $arguments;
+    return $arguments;
+}));
+$policy = new RecordingPolicy();
+$middleware = new MutatingMiddleware();
+$middleware->mutate = static function (MiddlewareToolCall $call): void {
+    $call->call->arguments = ['text' => 'mutated'];
+};
+$options = new AgentOptions(new ToolModel());
+$options->tools = $registry;
+$options->policy = $policy;
+$options->middleware[] = $middleware;
+$result = (new Agent($options))->run(new Session('s1'), 'go');
+$toolActions = array_values(array_filter(
+    $policy->actions,
+    static fn(Action $action): bool => $action->kind === 'tool.invoke',
+));
+check($result->output === 'done' && count($invoked) === 1, 'final arguments effect');
+check(count($toolActions) === 2, 'final arguments reauthorized');
+check($toolActions[0]->arguments['text'] === 'hi', 'original arguments authorized');
+check($toolActions[1]->arguments['text'] === 'mutated', 'final arguments authorized');
+check($invoked[0]['text'] === 'mutated', 'final arguments invoked');
+
+$echoCalls = 0;
+$otherCalls = 0;
+$registry = new ToolRegistry();
+$registry->register(new FuncTool('echo', 'Echo', static function (array $arguments) use (&$echoCalls): array {
+    $echoCalls++;
+    return $arguments;
+}));
+$registry->register(new FuncTool('other', 'Other', static function (array $arguments) use (&$otherCalls): array {
+    $otherCalls++;
+    return $arguments;
+}));
+$policy = new RecordingPolicy();
+$middleware = new MutatingMiddleware();
+$middleware->mutate = static function (MiddlewareToolCall $call): void {
+    $call->call->name = 'other';
+};
+$options = new AgentOptions(new ToolModel());
+$options->tools = $registry;
+$options->policy = $policy;
+$options->middleware[] = $middleware;
+(new Agent($options))->run(new Session('s1'), 'go');
+$toolActions = array_values(array_filter(
+    $policy->actions,
+    static fn(Action $action): bool => $action->kind === 'tool.invoke',
+));
+check($echoCalls === 0 && $otherCalls === 1, 'final name uses final tool');
+check(
+    count($toolActions) === 2
+    && $toolActions[0]->toolName === 'echo'
+    && $toolActions[1]->toolName === 'other',
+    'final name authorized',
+);
+
+$deniedCalls = 0;
+$deniedRegistry = new ToolRegistry();
+$deniedRegistry->register(new FuncTool('echo', 'Echo', static fn(array $arguments): array => $arguments));
+$deniedRegistry->register(new FuncTool('other', 'Other', static function (array $arguments) use (&$deniedCalls): array {
+    $deniedCalls++;
+    return $arguments;
+}));
+$deniedMiddleware = new MutatingMiddleware();
+$deniedMiddleware->mutate = static function (MiddlewareToolCall $call): void {
+    $call->call->name = 'other';
+};
+$deniedOptions = new AgentOptions(new ToolModel());
+$deniedOptions->tools = $deniedRegistry;
+$deniedOptions->allowedTools = ['echo'];
+$deniedOptions->middleware[] = $deniedMiddleware;
+try {
+    (new Agent($deniedOptions))->run(new Session('s1'), 'go');
+    check(false, 'final name allowlist');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_TOOL_NOT_ALLOWED' && $deniedCalls === 0, 'final name allowlist code');
+}
+
+$policy = new RecordingPolicy();
+$middleware = new MutatingMiddleware();
+$options = new AgentOptions(new ToolModel());
+$options->tools = $registry;
+$options->policy = $policy;
+$options->middleware[] = $middleware;
+(new Agent($options))->run(new Session('s1'), 'go');
+$toolActions = array_values(array_filter(
+    $policy->actions,
+    static fn(Action $action): bool => $action->kind === 'tool.invoke',
+));
+check(count($toolActions) === 1, 'unchanged call authorized once');
+
+$toolCalls = 0;
+$registry = new ToolRegistry();
+$registry->register(new FuncTool('echo', 'Echo', static function (array $arguments) use (&$toolCalls): array {
+    $toolCalls++;
+    return $arguments;
+}));
+$policy = new RecordingPolicy();
+$policy->handler = static fn(Action $action): Decision => $action->kind === 'tool.invoke'
+    ? Decision::deny('blocked')
+    : Decision::allow('ok');
+$middleware = new MutatingMiddleware();
+$options = new AgentOptions(new ToolModel());
+$options->tools = $registry;
+$options->policy = $policy;
+$options->middleware[] = $middleware;
+try {
+    (new Agent($options))->run(new Session('s1'), 'go');
+    check(false, 'initial denial');
+} catch (PraxoException $error) {
+    check(
+        $error->praxoCode === 'AGENT_POLICY_DENIED'
+        && $middleware->beforeToolCalls === 0
+        && $toolCalls === 0,
+        'initial denial prevents middleware and effect',
+    );
+}
+
+$calls = [];
+$sink = new RecordingSink();
+$first = new LifecycleMiddleware();
+$first->before = static function (RunState $state) use (&$calls): void {
+    $calls[] = 'first.before';
+};
+$first->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'first.after';
+};
+$second = new LifecycleMiddleware();
+$second->before = static function (RunState $state) use (&$calls): void {
+    $calls[] = 'second.before';
+    throw new PraxoException('STARTUP_FAILED', 'startup failed');
+};
+$second->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'second.after';
+};
+$third = new LifecycleMiddleware();
+$third->before = static function (RunState $state) use (&$calls): void {
+    $calls[] = 'third.before';
+};
+$third->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'third.after';
+};
+$options = new AgentOptions(new StaticModel('done'));
+$options->events = $sink;
+$options->middleware = [$first, $second, $third];
+try {
+    (new Agent($options))->run(new Session('s1'), 'go');
+    check(false, 'startup failure');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'STARTUP_FAILED' && $error->getMessage() === 'startup failed', 'startup failure preserved');
+}
+check($calls === ['first.before', 'second.before', 'first.after', 'second.after'], 'startup cleanup order');
+check($sink->events === [], 'startup emits no run events');
+
+$calls = [];
+$first = new LifecycleMiddleware();
+$first->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'first.after';
+    throw new PraxoException('CLEANUP_FAILED', 'cleanup failed');
+};
+$second = new LifecycleMiddleware();
+$second->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'second.after';
+};
+$options = new AgentOptions(new FailingModel());
+$options->middleware = [$first, $second];
+try {
+    (new Agent($options))->run(new Session('s1'), 'go');
+    check(false, 'run failure');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'RUN_FAILED' && $error->getMessage() === 'run failed', 'run error preserved');
+}
+check($calls === ['first.after', 'second.after'], 'after-run continues after failure');
+
+$calls = [];
+$sink = new RecordingSink();
+$first = new LifecycleMiddleware();
+$first->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'first.after';
+    throw new PraxoException('CLEANUP_FAILED', 'cleanup failed');
+};
+$second = new LifecycleMiddleware();
+$second->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'second.after';
+};
+$options = new AgentOptions(new StaticModel('done'));
+$options->events = $sink;
+$options->middleware = [$first, $second];
+try {
+    (new Agent($options))->run(new Session('s1'), 'go');
+    check(false, 'cleanup failure');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'CLEANUP_FAILED' && $error->getMessage() === 'cleanup failed', 'cleanup error fails closed');
+}
+check($calls === ['first.after', 'second.after'], 'cleanup continues after failure');
+check(
+    array_map(static fn(Event $event): string => $event->type, $sink->events) === ['run.started', 'run.failed'],
+    'cleanup failure emits failed',
+);
+
+$cancelled = false;
+$cancellation = static function () use (&$cancelled): bool {
+    return $cancelled;
+};
+$calls = [];
+$sink = new RecordingSink();
+$lifecycle = new LifecycleMiddleware();
+$lifecycle->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'after';
+};
+$options = new AgentOptions(new CancellingModel(static function () use (&$cancelled): void {
+    $cancelled = true;
+}));
+$options->cancellation = $cancellation;
+$options->events = $sink;
+$options->middleware[] = $lifecycle;
+try {
+    (new Agent($options))->run(new Session('s1'), 'go');
+    check(false, 'model cancellation');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_CANCELLED', 'model cancellation code');
+}
+check($calls === ['after'], 'model cancellation runs after-run');
+check(
+    array_map(static fn(Event $event): string => $event->type, $sink->events) === ['run.started', 'run.failed'],
+    'model cancellation emits failed',
+);
+
+$cancelled = false;
+$effectCalls = 0;
+$calls = [];
+$registry = new ToolRegistry();
+$registry->register(new FuncTool('cancel', 'Cancel', static function () use (&$cancelled): array {
+    $cancelled = true;
+    return [];
+}));
+$registry->register(new FuncTool('effect', 'Effect', static function () use (&$effectCalls): array {
+    $effectCalls++;
+    return [];
+}));
+$lifecycle = new LifecycleMiddleware();
+$lifecycle->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'after';
+};
+$options = new AgentOptions(new CancellationToolModel());
+$options->tools = $registry;
+$options->cancellation = $cancellation;
+$options->middleware[] = $lifecycle;
+try {
+    (new Agent($options))->run(new Session('s1'), 'go');
+    check(false, 'tool cancellation');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_CANCELLED', 'tool cancellation code');
+}
+check($effectCalls === 0, 'tool cancellation stops later effects');
+check($calls === ['after'], 'tool cancellation runs after-run');
+
+$calls = [];
+$sink = new RecordingSink();
+$lifecycle = new LifecycleMiddleware();
+$lifecycle->after = static function (?RunResult $result, ?PraxoException $error) use (&$calls): void {
+    $calls[] = 'after';
+};
+$options = new AgentOptions(new StreamFailureModel());
+$options->events = $sink;
+$options->middleware[] = $lifecycle;
+try {
+    (new Agent($options))->runStream(new Session('s1'), 'go', static function (string $delta): void {
+        throw new PraxoException('CALLBACK', 'callback failed');
+    });
+    check(false, 'stream callback failure');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'CALLBACK', 'stream callback code');
+}
+check($calls === ['after'], 'stream failure runs after-run');
+check(
+    array_map(static fn(Event $event): string => $event->type, $sink->events) === ['run.started', 'run.failed'],
+    'stream failure emits failed',
+);
+
+try {
+    \Praxo\Core\parseSseStream("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n", static function (string $delta): void {
+    });
+    check(false, 'sse truncation');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'MODEL_STREAM', 'sse truncation code');
+}
+try {
+    \Praxo\Core\parseSseStream(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\"",
+        static function (string $delta): void {
+        },
+    );
+    check(false, 'sse half packet');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'MODEL_STREAM', 'sse half packet code');
+}
+$response = \Praxo\Core\parseSseStream(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+    static function (string $delta): void {
+    },
+);
+check($response->message->content === 'hi', 'sse completion');
+
+$parallelModel = new ParallelModel();
+$parallelRegistry = new ToolRegistry();
+$parallelRegistry->register(new FuncTool('a', 'a', static fn (array $arguments): string => 'a'));
+$parallelRegistry->register(new FuncTool('b', 'b', static fn (array $arguments): string => 'b'));
+$parallelStarted = 0;
+$parallelRelease = false;
+$parallelOptions = new AgentOptions($parallelModel);
+$parallelOptions->tools = $parallelRegistry;
+$parallelOptions->maxParallelTools = 2;
+$parallelOptions->batchToolInvoker = static function (array $prepared, int $maxParallel) use (
+    &$parallelStarted,
+    &$parallelRelease,
+): array {
+    check($maxParallel === 2, 'parallel limit');
+    $fibers = [];
+    foreach ($prepared as $entry) {
+        $fibers[] = new \Fiber(static function () use ($entry, &$parallelStarted, &$parallelRelease): string {
+            $parallelStarted++;
+            \Fiber::suspend();
+            while (!$parallelRelease) {
+                \Fiber::suspend();
+            }
+            return $entry['tool']->invoke($entry['call']->arguments);
+        });
+    }
+    foreach ($fibers as $fiber) {
+        $fiber->start();
+    }
+    check($parallelStarted === 2, 'parallel started');
+    $parallelRelease = true;
+    $values = [];
+    foreach ($fibers as $fiber) {
+        $values[] = $fiber->resume();
+    }
+    return $values;
+};
+$parallelResult = (new Agent($parallelOptions))->run(new Session('s1'), 'go');
+check($parallelResult->output === 'done', 'parallel result');
+check($parallelModel->order === ['c1', 'c2'], 'parallel order');
+
+$hitlCalls = 0;
+$hitlRegistry = new ToolRegistry();
+$hitlRegistry->register(new FuncTool('echo', 'Echo', function (array $arguments) use (&$hitlCalls) {
+    $hitlCalls++;
+    return $arguments;
+}));
+$hitlOptions = new AgentOptions(new ToolModel());
+$hitlOptions->tools = $hitlRegistry;
+$hitlOptions->interruptOn = ['echo'];
+$hitlOptions->onInterruptDecision = fn (Interrupt $interrupt) => new InterruptDecision(InterruptAction::APPROVE);
+$hitlResult = (new Agent($hitlOptions))->run(new Session('s1'), 'go');
+check($hitlResult->output === 'done' && $hitlCalls === 1, 'hitl approve');
+
+$hitlCalls = 0;
+$hitlPolicy = new RecordingPolicy();
+$hitlOptions = new AgentOptions(new ToolModel());
+$hitlOptions->tools = $hitlRegistry;
+$hitlOptions->policy = $hitlPolicy;
+$hitlOptions->interruptOn = ['echo'];
+$hitlOptions->onInterruptDecision = fn (Interrupt $interrupt) => new InterruptDecision(
+    InterruptAction::EDIT,
+    ['value' => 'edited'],
+);
+(new Agent($hitlOptions))->run(new Session('s1'), 'go');
+$toolActions = array_values(array_filter(
+    $hitlPolicy->actions,
+    fn (Action $action) => $action->kind === 'tool.invoke',
+));
+check($hitlCalls === 1 && count($toolActions) === 2, 'hitl edit reauthorizes');
+
+$hitlCalls = 0;
+$hitlOptions = new AgentOptions(new ToolModel());
+$hitlOptions->tools = $hitlRegistry;
+$hitlOptions->interruptOn = ['echo'];
+$hitlOptions->onInterruptDecision = fn (Interrupt $interrupt) => new InterruptDecision(
+    InterruptAction::REJECT,
+    null,
+    '',
+    'no',
+);
+$hitlDenied = false;
+try {
+    (new Agent($hitlOptions))->run(new Session('s1'), 'go');
+} catch (PraxoException $error) {
+    $hitlDenied = $error->praxoCode === 'AGENT_APPROVAL_DENIED';
+}
+check($hitlDenied && $hitlCalls === 0, 'hitl reject');
+
+$hitlOptions = new AgentOptions(new ToolModel());
+$hitlOptions->tools = $hitlRegistry;
+$hitlOptions->interruptOn = ['echo'];
+$hitlUnhandled = false;
+try {
+    (new Agent($hitlOptions))->run(new Session('s1'), 'go');
+} catch (PraxoException $error) {
+    $hitlUnhandled = $error->praxoCode === 'AGENT_INTERRUPT_UNHANDLED';
+}
+check($hitlUnhandled, 'hitl unhandled');
+
+$hitlEvents = new class implements EventSink {
+    /** @var list<Event> */
+    public array $events = [];
+
+    public function emit(Event $event): void
+    {
+        $this->events[] = $event;
+    }
+};
+$hitlOptions = new AgentOptions(new ToolModel());
+$hitlOptions->tools = $hitlRegistry;
+$hitlOptions->events = $hitlEvents;
+$hitlOptions->interruptOn = ['echo'];
+$hitlOptions->onInterruptDecision = fn (Interrupt $interrupt) => new InterruptDecision(InterruptAction::APPROVE);
+(new Agent($hitlOptions))->run(new Session('s1'), 'go');
+$hitlInterrupts = array_filter($hitlEvents->events, fn (Event $event) => $event->type === 'tool.interrupt');
+check(count($hitlInterrupts) === 1, 'hitl event');
+
+
+$adapterPayload = null;
+$adapter = new \Praxo\Core\Adapters\OpenAICompatible(
+    'http://example.test/v1',
+    'test-model',
+    null,
+    function (string $path, array $payload) use (&$adapterPayload): array {
+        check($path === '/chat/completions', 'adapter path');
+        check($payload['model'] === 'test-model', 'adapter model');
+        check($payload['messages'][0]['role'] === Roles::USER, 'adapter role');
+        check($payload['tools'][0]['function']['name'] === 'echo', 'adapter tool');
+        $adapterPayload = $payload;
+        return [
+            'choices' => [[
+                'message' => [
+                    'content' => 'hello',
+                    'tool_calls' => [[
+                        'id' => 'c1',
+                        'function' => ['name' => 'echo', 'arguments' => '{"text":"hi"}'],
+                    ]],
+                ],
+                'finish_reason' => 'tool_calls',
+            ]],
+            'usage' => ['prompt_tokens' => 3, 'completion_tokens' => 2],
+        ];
+    }
+);
+$adapterRequest = new Request(
+    [Message::text(Roles::USER, 'hi')],
+    [new \Praxo\Core\ToolSpec('echo', 'echo', ['type' => 'object'])]
+);
+$adapterResponse = $adapter->generate($adapterRequest);
+check($adapterResponse->message->content === 'hello', 'adapter content');
+check($adapterResponse->message->toolCalls[0]->name === 'echo', 'adapter tool name');
+check($adapterResponse->message->toolCalls[0]->arguments['text'] === 'hi', 'adapter args');
+check($adapterResponse->usage->inputTokens === 3 && $adapterResponse->usage->outputTokens === 2, 'adapter usage');
+check($adapterResponse->finishReason === 'tool_calls', 'adapter finish');
+
+$captured = null;
+$toolAdapter = new \Praxo\Core\Adapters\OpenAICompatible(
+    'http://example.test/v1',
+    'test-model',
+    null,
+    function (string $_path, array $payload) use (&$captured): array {
+        $captured = $payload;
+        return ['choices' => [['message' => ['content' => 'ok']]]];
+    }
+);
+$toolAdapter->generate(new Request([
+    Message::assistant('', [new \Praxo\Core\ToolCall('c1', 'echo', ['text' => 'hi'])]),
+    Message::tool('result', 'c1'),
+]));
+check($captured['messages'][0]['tool_calls'][0]['id'] === 'c1', 'adapter assistant tool call');
+check($captured['messages'][0]['tool_calls'][0]['function']['arguments'] === '{"text":"hi"}', 'adapter tool args');
+check($captured['messages'][1]['tool_call_id'] === 'c1', 'adapter tool id');
+
+$harmovelaCaptured = null;
+$harmovela = new \Praxo\Core\Adapters\HarmovelaSink(
+    'http://example.test/aep/api/',
+    null,
+    null,
+    function (string $path, string $body, array $headers) use (&$harmovelaCaptured): array {
+        $harmovelaCaptured = [$path, $body, $headers];
+        return ['status' => 200, 'body' => ''];
+    },
+    static fn (): array => [1700000000, 123456789],
+);
+$harmovelaEvent = new Event('tool.call', 's1', 'run-123', ['name' => 'echo']);
+$harmovela->emit($harmovelaEvent);
+check($harmovelaCaptured[0] === '/events', 'harmovela path');
+check($harmovelaCaptured[2]['content-type'] === 'application/json', 'harmovela content type');
+$harmovelaEnvelope = Json::decode($harmovelaCaptured[1]);
+check($harmovelaEnvelope['spec_version'] === '0.2', 'harmovela spec version');
+check($harmovelaEnvelope['id'] === 'run-123-1700000000123456789', 'harmovela id');
+check($harmovelaEnvelope['type'] === 'tool.call', 'harmovela type');
+check($harmovelaEnvelope['source'] === 'praxo-core', 'harmovela source');
+check($harmovelaEnvelope['created_at'] === '2023-11-14T22:13:20.123456789Z', 'harmovela created at');
+check(
+    Json::equals($harmovelaEnvelope['payload'], [
+        'name' => 'echo',
+        'session_id' => 's1',
+        'run_id' => 'run-123',
+    ]),
+    'harmovela payload',
+);
+
+$harmovelaFailed = new \Praxo\Core\Adapters\HarmovelaSink(
+    'http://example.test/aep/api',
+    null,
+    null,
+    static fn (string $_path, string $_body, array $_headers): array => ['status' => 500, 'body' => 'boom'],
+    static fn (): array => [1700000000, 123456789],
+);
+$harmovelaError = null;
+try {
+    $harmovelaFailed->emit($harmovelaEvent);
+} catch (PraxoException $error) {
+    $harmovelaError = $error;
+}
+check($harmovelaError?->praxoCode === 'HARMOVELA_HTTP', 'harmovela non-2xx code');
+check(
+    $harmovelaError !== null
+        && str_contains($harmovelaError->getMessage(), '500')
+        && str_contains($harmovelaError->getMessage(), 'boom'),
+    'harmovela non-2xx body',
+);
+
+$anthropicPayload = null;
+$anthropic = new \Praxo\Core\Adapters\Anthropic(
+    'claude-test',
+    'ak',
+    transport: function (string $path, array $payload) use (&$anthropicPayload): array {
+        check($path === '/v1/messages', 'anthropic path');
+        $anthropicPayload = $payload;
+        return [
+            'content' => [
+                ['type' => 'text', 'text' => 'hello'],
+                ['type' => 'tool_use', 'id' => 'tool-1', 'name' => 'echo', 'input' => ['text' => 'hi']],
+            ],
+            'stop_reason' => 'end_turn',
+            'usage' => ['input_tokens' => 3, 'output_tokens' => 4, 'cache_read_input_tokens' => 2],
+        ];
+    },
+);
+$anthropicResponse = $anthropic->generate(new Request(
+    [Message::text(Roles::SYSTEM, 'be brief'), Message::text(Roles::USER, 'hi')],
+    [new \Praxo\Core\ToolSpec('echo', 'Echo', ['type' => 'object'])],
+));
+check($anthropicResponse->message->content === 'hello', 'anthropic content');
+check($anthropicResponse->message->toolCalls[0]->id === 'tool-1', 'anthropic call id');
+check($anthropicResponse->message->toolCalls[0]->arguments['text'] === 'hi', 'anthropic args');
+check($anthropicResponse->usage->cachedTokens === 2, 'anthropic cached');
+check($anthropicPayload['system'] === 'be brief', 'anthropic system');
+check($anthropicPayload['tools'][0]['input_schema']['type'] === 'object', 'anthropic tools');
+
+$geminiPayload = null;
+$gemini = new \Praxo\Core\Adapters\Gemini(
+    'gemini-test',
+    'gk',
+    transport: function (string $path, array $payload) use (&$geminiPayload): array {
+        check(str_ends_with($path, ':generateContent'), 'gemini path');
+        $geminiPayload = $payload;
+        return [
+            'candidates' => [[
+                'content' => ['parts' => [
+                    ['text' => 'hello'],
+                    ['functionCall' => ['name' => 'echo', 'args' => ['text' => 'hi']]],
+                ]],
+                'finishReason' => 'STOP',
+            ]],
+            'usageMetadata' => ['promptTokenCount' => 3, 'candidatesTokenCount' => 4],
+        ];
+    },
+);
+$geminiResponse = $gemini->generate(new Request(
+    [Message::text(Roles::SYSTEM, 'be brief'), Message::text(Roles::USER, 'hi')],
+    [new \Praxo\Core\ToolSpec('echo', 'Echo', ['type' => 'object'])],
+));
+check($geminiResponse->message->content === 'hello', 'gemini content');
+check($geminiResponse->message->toolCalls[0]->name === 'echo', 'gemini call name');
+check($geminiResponse->usage->inputTokens === 3, 'gemini usage');
+check($geminiPayload['system_instruction']['parts'][0]['text'] === 'be brief', 'gemini system');
+check($geminiPayload['toolConfig']['functionCallingConfig']['mode'] === 'AUTO', 'gemini tool mode');
+
+$mcp = new \Praxo\Core\Adapters\MCPClient(new class implements \Praxo\Core\Adapters\MCPTransport {
+    public array $notifications = [];
+
+    public function request(string $method, array $params, float $timeout): array
+    {
+        if ($method === 'initialize') {
+            return ['protocolVersion' => '2024-11-05', 'serverInfo' => ['name' => 'fake']];
+        }
+        if ($method === 'tools/list') {
+            if (isset($params['cursor'])) {
+                return ['tools' => [['name' => 'echo']]];
+            }
+            return ['tools' => [['name' => 'add']], 'nextCursor' => 'next'];
+        }
+        if ($method === 'tools/call') {
+            if (($params['name'] ?? '') === 'echo') {
+                return ['structuredContent' => ['ok' => true]];
+            }
+            if (($params['name'] ?? '') === 'text') {
+                return ['content' => [['type' => 'text', 'text' => 'hello']]];
+            }
+            if (($params['name'] ?? '') === 'fail') {
+                return ['isError' => true];
+            }
+            throw new \Praxo\Core\PraxoException('MCP_TIMEOUT', 'mcp: timed out');
+        }
+        return [];
+    }
+
+    public function notify(string $method, array $params): void
+    {
+        $this->notifications[] = [$method, $params];
+    }
+
+    public function close(): void
+    {
+    }
+});
+$mcp->start();
+check($mcp->protocolVersion() === '2024-11-05', 'mcp protocol version');
+$mcpTools = $mcp->listTools();
+check(array_column($mcpTools, 'name') === ['add', 'echo'], 'mcp paginated tools');
+check($mcp->callTool('echo', ['text' => 'hi']) === ['ok' => true], 'mcp structured tool');
+check($mcp->callTool('text') === 'hello', 'mcp text tool');
+$mcpError = null;
+try {
+    $mcp->callTool('fail');
+} catch (\Praxo\Core\PraxoException $error) {
+    $mcpError = $error;
+}
+check($mcpError?->praxoCode === 'MCP_TOOL_ERROR', 'mcp tool error');
+$mcpTimeout = null;
+try {
+    $mcp->callTool('hang');
+} catch (\Praxo\Core\PraxoException $error) {
+    $mcpTimeout = $error;
+}
+check($mcpTimeout?->praxoCode === 'MCP_TIMEOUT', 'mcp timeout');
+
+$http = new class extends \Praxo\Core\Adapters\HttpMCPTransport {
+    public array $requests = [];
+
+    public function __construct()
+    {
+        parent::__construct('http://127.0.0.1/mcp');
+    }
+
+    protected function send(string $method, ?string $body, array $headers, float $timeout): array
+    {
+        $this->requests[] = ['method' => $method, 'body' => $body, 'headers' => $headers];
+        if ($method === 'DELETE') {
+            return [200, [], ''];
+        }
+        $message = json_decode($body ?? '{}', true);
+        $name = $message['method'] ?? '';
+        $id = $message['id'] ?? null;
+        if ($name === 'initialize') {
+            return [200, [
+                'mcp-session-id' => 'sess-1',
+                'content-type' => 'application/json',
+            ], json_encode([
+                'jsonrpc' => '2.0',
+                'id' => $id,
+                'result' => [
+                    'protocolVersion' => '2025-03-26',
+                    'capabilities' => [],
+                    'serverInfo' => ['name' => 'fake-http', 'version' => '1'],
+                ],
+            ])];
+        }
+        if (str_starts_with((string) $name, 'notifications/')) {
+            return [202, [], ''];
+        }
+        if ($name === 'tools/list') {
+            return [200, ['content-type' => 'application/json'], json_encode([
+                'jsonrpc' => '2.0',
+                'id' => $id,
+                'result' => ['tools' => [[
+                    'name' => 'echo',
+                    'description' => 'Echo input',
+                    'inputSchema' => [
+                        'type' => 'object',
+                        'properties' => ['text' => ['type' => 'string']],
+                        'required' => ['text'],
+                    ],
+                ]]],
+            ])];
+        }
+        if ($name === 'tools/call') {
+            $result = json_encode([
+                'jsonrpc' => '2.0',
+                'id' => $id,
+                'result' => ['content' => [['type' => 'text', 'text' => 'sse-ok']]],
+            ]);
+            return [200, ['content-type' => 'text/event-stream'], "event: message\ndata: {$result}\n\n"];
+        }
+        return [200, ['content-type' => 'application/json'], json_encode([
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => [],
+        ])];
+    }
+};
+$httpClient = new \Praxo\Core\Adapters\MCPClient($http, '0.6.0', 5.0, '2025-03-26');
+$httpClient->start();
+check($httpClient->protocolVersion() === '2025-03-26', 'http mcp protocol version');
+check(array_column($httpClient->listTools(), 'name') === ['echo'], 'http mcp tools');
+check($httpClient->callTool('echo', ['text' => 'hi']) === 'sse-ok', 'http mcp sse call');
+$httpClient->close();
+$listed = null;
+foreach ($http->requests as $request) {
+    $decoded = json_decode($request['body'] ?? '{}', true);
+    if (is_array($decoded) && ($decoded['method'] ?? '') === 'tools/list') {
+        $listed = $request;
+        break;
+    }
+}
+check($listed !== null, 'http mcp tools request');
+check(($listed['headers']['MCP-Session-Id'] ?? '') === 'sess-1', 'http mcp session header');
+check(($listed['headers']['MCP-Protocol-Version'] ?? '') === '2025-03-26', 'http mcp protocol header');
+
+$httpRejected = null;
+try {
+    new \Praxo\Core\Adapters\HttpMCPTransport('http://example.com/mcp');
+} catch (\Praxo\Core\PraxoException $error) {
+    $httpRejected = $error;
+}
+check($httpRejected?->praxoCode === 'MCP_TRANSPORT', 'http mcp https required');
+
+$otelCalls = [];
+$otelTransport = function (string $url, string $body, array $headers) use (&$otelCalls): array {
+    $otelCalls[] = ['url' => $url, 'body' => $body, 'headers' => $headers];
+    return ['status' => 200, 'body' => ''];
+};
+$otel = new \Praxo\Core\Adapters\OtelSink(
+    endpoint: 'http://otel.test/v1/traces',
+    serviceName: 'praxo-test',
+    transport: $otelTransport,
+    allowedDataKeys: ['name'],
+);
+$otelEvent = new Event(
+    'tool.call',
+    's1',
+    'run-123',
+    ['name' => 'echo', 'secret' => 'hidden'],
+    '2026-11-10T07:00:00Z',
+);
+$otel->emit($otelEvent);
+check(count($otelCalls) === 1, 'otel single request');
+check($otelCalls[0]['url'] === 'http://otel.test/v1/traces', 'otel url');
+check($otelCalls[0]['headers']['content-type'] === 'application/json', 'otel content type');
+$otelPayload = Json::decode($otelCalls[0]['body']);
+$otelSpan = $otelPayload['resourceSpans'][0]['scopeSpans'][0]['spans'][0];
+check($otelSpan['name'] === 'praxo.tool.call', 'otel span name');
+check(strlen($otelSpan['traceId']) === 32, 'otel trace id');
+check(strlen($otelSpan['spanId']) === 16, 'otel span id');
+$otelAttributes = [];
+foreach ($otelSpan['attributes'] as $item) {
+    $otelAttributes[$item['key']] = $item['value']['stringValue'];
+}
+check($otelAttributes['praxo.event.data.name'] === 'echo', 'otel allowed data');
+check(!array_key_exists('praxo.event.data.secret', $otelAttributes), 'otel data excluded');
+$otel->emit($otelEvent);
+$otelSecond = Json::decode($otelCalls[1]['body']);
+$otelSecondSpan = $otelSecond['resourceSpans'][0]['scopeSpans'][0]['spans'][0];
+check($otelSecondSpan['traceId'] === $otelSpan['traceId'], 'otel deterministic trace');
+check($otelSecondSpan['spanId'] === $otelSpan['spanId'], 'otel deterministic span');
+$otelError = null;
+try {
+    (new \Praxo\Core\Adapters\OtelSink(
+        endpoint: 'http://otel.test/v1/traces',
+        transport: static fn (string $url, string $body, array $headers): array
+            => ['status' => 503, 'body' => 'down'],
+    ))->emit($otelEvent);
+} catch (\Praxo\Core\PraxoException $error) {
+    $otelError = $error;
+}
+check($otelError?->praxoCode === 'OTEL_HTTP', 'otel error');
+
+$document = new \Praxo\Core\Document('doc-1', 'hello:3', ['source' => 'test'], 0.5);
+check($document->toWire()['score'] === 0.5, 'retriever wire');
+$retriever = new \Praxo\Core\FuncRetriever(
+    static fn (string $query, int $limit): array => [
+        new \Praxo\Core\Document('doc-1', "{$query}:{$limit}"),
+    ],
+);
+$documents = $retriever->retrieve('hello', 3);
+check(count($documents) === 1 && $documents[0]->content === 'hello:3', 'retriever');
+
+$immediate = new class implements \Praxo\Core\SubagentRunner {
+    public function run(\Praxo\Core\SubagentRequest $request): \Praxo\Core\SubagentResult
+    {
+        return new \Praxo\Core\SubagentResult(output: 'done');
+    }
+};
+$manager = new \Praxo\Core\SubagentManager($immediate);
+$task = $manager->run(new \Praxo\Core\SubagentRequest('parent', 'child', 'do', mode: 'fork'));
+check($task->status === 'completed' && $task->output === 'done', 'delegation completed');
+$failing = new class implements \Praxo\Core\SubagentRunner {
+    public function run(\Praxo\Core\SubagentRequest $request): \Praxo\Core\SubagentResult
+    {
+        throw new \RuntimeException('boom');
+    }
+};
+$failed = (new \Praxo\Core\SubagentManager($failing))
+    ->run(new \Praxo\Core\SubagentRequest('parent', 'child', 'do'));
+check($failed->status === 'failed' && str_contains($failed->error, 'boom'), 'delegation failed');
+$invalid = null;
+try {
+    (new \Praxo\Core\SubagentManager($immediate))
+        ->run(new \Praxo\Core\SubagentRequest('', 'child', 'do'));
+} catch (\Praxo\Core\PraxoException $error) {
+    $invalid = $error;
+}
+check($invalid?->praxoCode === 'SUBAGENT_INVALID', 'delegation invalid');
+
+echo "PHP core tests passed ({$passed})\n";
+

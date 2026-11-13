@@ -1,4 +1,4 @@
-﻿# PRAXO-CORE PHP Core
+# PRAXO-CORE PHP Core
 
 PRAXO-CORE is an embeddable, MIT-licensed agent framework. This package is its
 native PHP Core: an agent loop with tool registration and dispatch, policy
@@ -6,8 +6,8 @@ hooks, typed events, memory, checkpoints, context budgets, middleware, JSON
 Schema validation, and plugin manifest parsing.
 
 - `SPEC_VERSION`: `0.2.0`
-- Core version: `0.5.0`
-- The latest Packagist package is `axisvela/praxo-core@0.5.0`
+- Core version: `0.4.1`
+- The latest Packagist package is `axisvela/praxo-core@0.4.1`
 - License: MIT
 - Dependencies: none beyond the PHP standard library
 - Runtime: use a patched PHP release. On Windows use `8.2.35-1`, `8.3.36-1`,
@@ -32,8 +32,7 @@ The Core implements all eleven vector groups: toolcall, jsonschema, plugin,
 checkpoint, event, memory, policy, stream, context, middleware, agent loop, and
 human-in-the-loop interrupt decisions. It includes a public API snapshot and
 dependency-free tests. `0.4.1` adds Composer autoload metadata and the optional
-`Praxo\Core\Adapters\OpenAICompatible` adapter; other provider adapters are not
-included.
+`Praxo\Core\Adapters\OpenAICompatible`, `Anthropic`, and `Gemini` adapters.
 
 `maxParallelTools` and `batchToolInvoker` add caller-provided cooperative
 parallel tool dispatch. The Core prepares and authorizes each call, then the
@@ -84,6 +83,22 @@ $options->maxSteps = 8;
 $agent = new Agent($options);
 ```
 
+## Model Adapters
+
+- `Praxo\Core\Adapters\OpenAICompatible` for OpenAI, DeepSeek, Kimi/Moonshot,
+  and other OpenAI-compatible endpoints.
+- `Praxo\Core\Adapters\Anthropic` for the Anthropic Messages API.
+- `Praxo\Core\Adapters\Gemini` for the Gemini generateContent API.
+
+Each adapter accepts an injectable transport callable.
+
+## MCP Client
+
+`Praxo\Core\Adapters\MCPClient` implements a stdio JSON-RPC MCP session with
+initialize, paginated tool listing, tool calls, timeouts, and cancellation
+notifications. `StdioMCPTransport` starts a child process; tests can implement
+`MCPTransport` directly.
+
 ## Harmovela Event Sink
 
 `Praxo\Core\Adapters\HarmovelaSink` implements `EventSink` and posts to
@@ -109,6 +124,5 @@ exactly-once delivery. Use HTTPS and filter sensitive event data first.
 
 ## Release
 
-Tag shape: `php/v0.4.1`. The tag targets `SPEC_VERSION` `0.2.0`. See
+Tag shape: `php/v0.7.0`. The tag targets `SPEC_VERSION` `0.2.0`. See
 [CHANGELOG.md](CHANGELOG.md) for per-release changes and compatibility notes.
-
