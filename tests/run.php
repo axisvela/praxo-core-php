@@ -43,6 +43,7 @@ use Praxo\Core\RunState;
 use Praxo\Core\Session;
 use Praxo\Core\StaticModel;
 use Praxo\Core\StreamingModel;
+use Praxo\Core\Tool;
 use Praxo\Core\ToolCall;
 use Praxo\Core\ToolCallParser;
 use Praxo\Core\ToolRegistry;
@@ -59,6 +60,32 @@ final class ToolModel implements Model
             ]));
         }
         return new Response(Message::assistant('done'));
+    }
+}
+
+final class SchemaTool implements Tool
+{
+    public array $parameters = [
+        'type' => 'object',
+        'required' => ['target'],
+        'properties' => ['target' => ['type' => 'string']],
+    ];
+
+    public string $risk = 'write';
+
+    public function name(): string
+    {
+        return 'record';
+    }
+
+    public function description(): string
+    {
+        return 'Record a target.';
+    }
+
+    public function invoke(array $arguments): mixed
+    {
+        return 'recorded';
     }
 }
 
@@ -323,6 +350,45 @@ try {
 } catch (PraxoException $error) {
     check($error->praxoCode === 'AGENT_CONTEXT_BUDGET', 'capacity fail closed code');
 }
+
+$policyGuardOptions = new AgentOptions(new StaticModel('done'));
+$policyGuardOptions->requirePolicy = true;
+try {
+    new Agent($policyGuardOptions);
+    check(false, 'require policy guard');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_INVALID_OPTIONS', 'require policy guard code');
+    check($error->getMessage() === 'agent: require policy: policy is required', 'require policy guard message');
+}
+
+$policyConfiguredOptions = new AgentOptions(new StaticModel('done'));
+$policyConfiguredOptions->requirePolicy = true;
+$policyConfiguredOptions->policy = new RecordingPolicy();
+$policyConfiguredResult = (new Agent($policyConfiguredOptions))->run(new Session('s1'), 'go');
+check($policyConfiguredResult->output === 'done', 'require policy configured');
+
+$scopeGuardOptions = new AgentOptions(new StaticModel('done'));
+$scopeGuardOptions->requireToolScope = true;
+try {
+    new Agent($scopeGuardOptions);
+    check(false, 'require tool scope guard');
+} catch (PraxoException $error) {
+    check($error->praxoCode === 'AGENT_INVALID_OPTIONS', 'require tool scope guard code');
+    check(
+        $error->getMessage() === 'agent: require tool scope: allowedTools must not be empty',
+        'require tool scope guard message',
+    );
+}
+
+$scopeConfiguredOptions = new AgentOptions(new StaticModel('done'));
+$scopeConfiguredOptions->requireToolScope = true;
+$scopeConfiguredOptions->allowedTools = ['echo'];
+$scopeConfiguredResult = (new Agent($scopeConfiguredOptions))->run(new Session('s1'), 'go');
+check($scopeConfiguredResult->output === 'done', 'require tool scope configured');
+
+$defaultGuardOptions = new AgentOptions(new StaticModel('done'));
+$defaultGuardResult = (new Agent($defaultGuardOptions))->run(new Session('s1'), 'go');
+check($defaultGuardResult->output === 'done', 'agent guards default off');
 
 $agent = new Agent(new AgentOptions(new StaticModel('hello')));
 $result = $agent->run(new Session('s1'), 'hello');
@@ -1164,6 +1230,14 @@ try {
     $invalid = $error;
 }
 check($invalid?->praxoCode === 'SUBAGENT_INVALID', 'delegation invalid');
+
+$schemaRegistry = new ToolRegistry();
+$schemaRegistry->register(new SchemaTool());
+$schemaSpec = $schemaRegistry->specs()[0];
+check(
+    $schemaSpec->parameters['required'] === ['target'] && $schemaSpec->risk === 'write',
+    'tool schema',
+);
 
 echo "PHP core tests passed ({$passed})\n";
 

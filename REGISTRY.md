@@ -1,7 +1,7 @@
 # PRAXO-CORE PHP Registry Introduction
 
-**Status:** published. Source version `0.7.1`, source
-tag `php/v0.7.0`. Published registry version: `0.4.1`. Registry
+**Status:** published. Source version `0.8.2`, source
+tag `php/v0.8.2`. Published registry version: `0.8.1`. Registry
 pages are release snapshots; verify the published version before relying on a
 feature.
 
@@ -9,17 +9,19 @@ feature.
 
 PRAXO-CORE is an embeddable, MIT-licensed agent framework. This package is its native PHP Core: an agent loop with tool registration and dispatch, policy hooks, typed events, memory, checkpoints, context budgets, middleware, JSON Schema validation, and plugin manifest parsing.
 
+Use it when an existing PHP application needs a governed model/tool loop without adding a Python or Go sidecar. It is not an HTTP user agent, crawler, hosted agent service, or model provider.
+
 ## Package
 
 | Field | Value |
 | --- | --- |
 | Package | `axisvela/praxo-core` |
 | Registry | [Packagist](https://packagist.org/packages/axisvela/praxo-core) |
-| Source version | `0.7.1` |
-| Published registry version | `0.4.1` |
+| Source version | `0.8.2` |
+| Published registry version | `0.8.1` |
 | Install (published) | `composer require axisvela/praxo-core` |
 | Install (source/release prepared) | `composer require axisvela/praxo-core` |
-| Source tag | `php/v0.7.0` |
+| Source tag | `php/v0.8.2` |
 | Tier | Core |
 | Contract | `SPEC_VERSION` `0.2.0` |
 | Documentation | https://axisvela.github.io/praxo-core/languages/php/ |
@@ -39,10 +41,16 @@ PRAXO-CORE is an embeddable, MIT-licensed agent framework. This package is its n
 
 ## Coding-agent entry
 
+- [Examples](https://github.com/axisvela/praxo-core/tree/main/language/php/examples): runnable language-specific examples.
 - [llms.txt](llms.txt): compact machine-readable entry for this language.
 - [llms.md](llms.md): Markdown version of the same entry.
 - [Coding-agent contract](../../docs/getting-started/coding-agents.md): explicit
   scope, final-argument authorization, denial tests, and verification commands.
+
+## Community
+
+- X: <https://x.com/axisvela>
+- Weibo: <https://weibo.com/u/1936025761>
 
 ## Boundaries
 

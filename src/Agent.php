@@ -79,7 +79,17 @@ final class ToolRegistry
     public function specs(): array
     {
         $specs = array_map(
-            static fn (Tool $tool): ToolSpec => new ToolSpec($tool->name(), $tool->description()),
+            static function (Tool $tool): ToolSpec {
+                if (method_exists($tool, 'spec')) {
+                    return $tool->spec();
+                }
+                return new ToolSpec(
+                    $tool->name(),
+                    $tool->description(),
+                    property_exists($tool, 'parameters') ? $tool->parameters : null,
+                    property_exists($tool, 'risk') ? $tool->risk : null,
+                );
+            },
             array_values($this->tools),
         );
         usort($specs, static fn (ToolSpec $left, ToolSpec $right): int => strcmp($left->name, $right->name));
@@ -136,6 +146,8 @@ final class AgentOptions
     public array $interruptOn = [];
     public mixed $onInterruptDecision = null;
     public mixed $onInterrupt = null;
+    public bool $requirePolicy = false;
+    public bool $requireToolScope = false;
 
     public function __construct(public Model $model)
     {
@@ -152,6 +164,18 @@ final class Agent
 
     public function __construct(private AgentOptions $options)
     {
+        if ($options->requirePolicy && $options->policy === null) {
+            throw new PraxoException(
+                'AGENT_INVALID_OPTIONS',
+                'agent: require policy: policy is required',
+            );
+        }
+        if ($options->requireToolScope && $options->allowedTools === []) {
+            throw new PraxoException(
+                'AGENT_INVALID_OPTIONS',
+                'agent: require tool scope: allowedTools must not be empty',
+            );
+        }
         $memory = self::loadAgentsMd($options->memoryFiles);
         $this->systemPrompt = $memory === ''
             ? $options->systemPrompt

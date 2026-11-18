@@ -5,9 +5,13 @@ native PHP Core: an agent loop with tool registration and dispatch, policy
 hooks, typed events, memory, checkpoints, context budgets, middleware, JSON
 Schema validation, and plugin manifest parsing.
 
+Use it when an existing PHP application needs a governed model/tool loop without
+adding a Python or Go sidecar. It is not an HTTP user agent, crawler, hosted
+agent service, or model provider.
+
 - `SPEC_VERSION`: `0.2.0`
-- Core version: `0.4.1`
-- The latest Packagist package is `axisvela/praxo-core@0.4.1`
+- Core version: `0.8.2`
+- The latest Packagist package is `axisvela/praxo-core@0.8.2`
 - License: MIT
 - Dependencies: none beyond the PHP standard library
 - Runtime: use a patched PHP release. On Windows use `8.2.35-1`, `8.3.36-1`,
@@ -17,8 +21,47 @@ Schema validation, and plugin manifest parsing.
 
 - Registry introduction: [REGISTRY.md](https://github.com/axisvela/praxo-core/blob/main/language/php/REGISTRY.md)
 - Machine-readable entry: [llms.txt](https://github.com/axisvela/praxo-core/blob/main/language/php/llms.txt) and [llms.md](https://github.com/axisvela/praxo-core/blob/main/language/php/llms.md)
+- [Examples](https://github.com/axisvela/praxo-core/tree/main/language/php/examples): runnable language-specific examples.
 - Coding-agent contract: [docs/getting-started/coding-agents.md](https://github.com/axisvela/praxo-core/blob/main/docs/getting-started/coding-agents.md)
 - Registry: [Packagist](https://packagist.org/packages/axisvela/praxo-core)
+- Community: [X](https://x.com/axisvela) · [Weibo](https://weibo.com/u/1936025761)
+
+## Get started
+
+Install the published package:
+
+```bash
+composer require axisvela/praxo-core
+```
+
+Then run the smallest deterministic example:
+
+- [Consumer starter](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/consumer): explicit tool scope and a deny check.
+- [Live model](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/live-model): connect an OpenAI-compatible endpoint and register `get_time`.
+
+See the [PHP documentation](https://axisvela.github.io/praxo-core/languages/php/) for the full API and the
+[language matrix](https://axisvela.github.io/praxo-core/languages/matrix/) for
+current scope.
+
+## Examples
+
+Runnable examples live under [`language/php/examples`](https://github.com/axisvela/praxo-core/tree/main/language/php/examples).
+
+| Goal | Example |
+| --- | --- |
+| Install and deny one unsafe call | [consumer](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/consumer) |
+| Connect a real model | [live-model](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/live-model) |
+| Connect MCP tools | [mcp](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/mcp) |
+| Validate structured output | [structured-output](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/structured-output) |
+| Stream a response | [streaming](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/streaming) |
+| Add identity and policy | [identity-policy](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/identity-policy) |
+| Persist checkpoints | [checkpoint](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/checkpoint) |
+| Run behind HTTP | [service](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/service) |
+| Approve or edit a tool call | [hitl](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/hitl) |
+| Resume a multi-turn session | [session-checkpoint](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/session-checkpoint) |
+| Retry transient failures | [retry](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/retry) |
+| Add provider fallback | [provider-fallback](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/provider-fallback) |
+| Observe agent events | [event-sink](https://github.com/axisvela/praxo-core/tree/main/language/php/examples/event-sink) |
 
 ## Install
 
@@ -31,7 +74,7 @@ composer require axisvela/praxo-core
 The Core implements all eleven vector groups: toolcall, jsonschema, plugin,
 checkpoint, event, memory, policy, stream, context, middleware, agent loop, and
 human-in-the-loop interrupt decisions. It includes a public API snapshot and
-dependency-free tests. `0.4.1` adds Composer autoload metadata and the optional
+dependency-free tests. `0.8.2` includes Composer autoload metadata and the optional
 `Praxo\Core\Adapters\OpenAICompatible`, `Anthropic`, and `Gemini` adapters.
 
 `maxParallelTools` and `batchToolInvoker` add caller-provided cooperative
@@ -42,9 +85,9 @@ uses PHP Fibers; the Core itself does not create threads.
 ## Build and test
 
 ```bash
-php language/php/conformance/run.php
-php language/php/conformance/run.php --check-api
-php language/php/tests/run.php
+php conformance/run.php
+php conformance/run.php --check-api
+php tests/run.php
 composer validate --strict --no-check-publish
 ```
 
@@ -120,9 +163,9 @@ exactly-once delivery. Use HTTPS and filter sensitive event data first.
 - `src/` library (PSR-4 `Praxo\Core\`).
 - `conformance/run.php` vector runner, API snapshot, and check mode.
 - `tests/run.php` dependency-free core tests.
-- `api/0.4.1.txt` checked-in public API snapshot.
+- `api/0.8.2.txt` checked-in public API snapshot.
 
 ## Release
 
-Tag shape: `php/v0.7.0`. The tag targets `SPEC_VERSION` `0.2.0`. See
+Tag shape: `php/v0.8.2`. The tag targets `SPEC_VERSION` `0.2.0`. See
 [CHANGELOG.md](CHANGELOG.md) for per-release changes and compatibility notes.
