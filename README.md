@@ -10,8 +10,8 @@ adding a Python or Go sidecar. It is not an HTTP user agent, crawler, hosted
 agent service, or model provider.
 
 - `SPEC_VERSION`: `0.2.0`
-- Core version: `0.8.2`
-- The latest Packagist package is `axisvela/praxo-core@0.8.2`
+- Core version: `0.10.0`
+- The latest Packagist package is `axisvela/praxo-core@0.10.0`
 - License: MIT
 - Dependencies: none beyond the PHP standard library
 - Runtime: use a patched PHP release. On Windows use `8.2.35-1`, `8.3.36-1`,
@@ -24,7 +24,7 @@ agent service, or model provider.
 - [Examples](https://github.com/axisvela/praxo-core/tree/main/language/php/examples): runnable language-specific examples.
 - Coding-agent contract: [docs/getting-started/coding-agents.md](https://github.com/axisvela/praxo-core/blob/main/docs/getting-started/coding-agents.md)
 - Registry: [Packagist](https://packagist.org/packages/axisvela/praxo-core)
-- Community: [X](https://x.com/axisvela) · [Weibo](https://weibo.com/u/1936025761)
+- Community: [X](https://x.com/axisvela) · [Weibo](https://weibo.com/u/1936025761) · [LinkedIn](https://www.linkedin.com/company/axisvela/) · [Facebook](https://www.facebook.com/profile.php?id=61596905732406) · [YouTube](https://www.youtube.com/@axisvela) · [Discord](https://discord.com/channels/1575163993767809064/1575164343148875977) · [GitHub Discussions](https://github.com/axisvela/praxo-core/discussions) · [GitHub Issues](https://github.com/axisvela/praxo-core/issues) · [Documentation](https://axisvela.github.io/praxo-core/) · [Architect](https://axisvela.architect.pub)
 
 ## Get started
 
@@ -74,7 +74,7 @@ composer require axisvela/praxo-core
 The Core implements all eleven vector groups: toolcall, jsonschema, plugin,
 checkpoint, event, memory, policy, stream, context, middleware, agent loop, and
 human-in-the-loop interrupt decisions. It includes a public API snapshot and
-dependency-free tests. `0.8.2` includes Composer autoload metadata and the optional
+dependency-free tests. The package includes Composer autoload metadata and the optional
 `Praxo\Core\Adapters\OpenAICompatible`, `Anthropic`, and `Gemini` adapters.
 
 `maxParallelTools` and `batchToolInvoker` add caller-provided cooperative
@@ -85,9 +85,9 @@ uses PHP Fibers; the Core itself does not create threads.
 ## Build and test
 
 ```bash
-php conformance/run.php
-php conformance/run.php --check-api
-php tests/run.php
+php language/php/conformance/run.php
+php language/php/conformance/run.php --check-api
+php language/php/tests/run.php
 composer validate --strict --no-check-publish
 ```
 
@@ -130,10 +130,14 @@ $agent = new Agent($options);
 
 - `Praxo\Core\Adapters\OpenAICompatible` for OpenAI, DeepSeek, Kimi/Moonshot,
   and other OpenAI-compatible endpoints.
-- `Praxo\Core\Adapters\Anthropic` for the Anthropic Messages API.
+- `Praxo\Core\Adapters\Anthropic` for the Anthropic Messages API, including `generateStream` SSE reassembly.
 - `Praxo\Core\Adapters\Gemini` for the Gemini generateContent API.
 
-Each adapter accepts an injectable transport callable.
+Each adapter accepts an injectable transport callable. `OpenAICompatible`
+implements `StreamingModel`; `generateStream` sets `stream: true`, parses SSE,
+reassembles content, fragmented tool calls, usage, and `finish_reason`, and
+calls the delta callback. Pass a `streamTransport` returning raw SSE text, or
+use `Agent::runStream`.
 
 ## MCP Client
 
@@ -163,9 +167,9 @@ exactly-once delivery. Use HTTPS and filter sensitive event data first.
 - `src/` library (PSR-4 `Praxo\Core\`).
 - `conformance/run.php` vector runner, API snapshot, and check mode.
 - `tests/run.php` dependency-free core tests.
-- `api/0.8.2.txt` checked-in public API snapshot.
+- `api/0.9.0.txt` checked-in public API snapshot.
 
 ## Release
 
-Tag shape: `php/v0.8.2`. The tag targets `SPEC_VERSION` `0.2.0`. See
+Tag shape: `php/v0.9.0`. The tag targets `SPEC_VERSION` `0.2.0`. See
 [CHANGELOG.md](CHANGELOG.md) for per-release changes and compatibility notes.
